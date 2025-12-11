@@ -49,9 +49,9 @@ DEFAULT_USE_MPC = True
 DEFAULT_MPC_PARAMS = {
     'horizon': 10,
     'dt': 1.0 / DEFAULT_CONTROL_FREQ_HZ,  # outer loop dt by default
-    'max_vel': 0.5,          # m/s
+    'max_vel': 5,          # m/s
     'max_yaw_rate': 1.0,     # rad/s
-    'safety_margin': 0.20,   # m
+    'safety_margin': 0.05,   # m
     'slack_weight': 50.0,
 }
 
@@ -170,8 +170,8 @@ def run(
         # Two static obstacles along the forward path
         # (same style as your QP example but you can move them closer/further)
         obstacles = [
-            {'pos': [1.2, 0.0, 1.0], 'vel': [0.0, 0.0, 0.0]},
-            {'pos': [1.7, 0.0, 1.0], 'vel': [0.0, 0.0, 0.0]},
+            {'pos': [1.2, 0, 1.0], 'vel': [0.0, 0.0, 0.0]},
+            {'pos': [1.7, 0, 1.0], 'vel': [0.0, 0.0, 0.0]},
         ]
 
         obs_radius = 0.1
@@ -180,7 +180,7 @@ def run(
             visual_shape = p.createVisualShape(
                 shapeType=p.GEOM_SPHERE,
                 radius=obs_radius,
-                rgbaColor=[1.0, 0.0, 0.0, 0.6],
+                rgbaColor=[1.0, 0.0, 0.0, 1],
                 physicsClientId=PYB_CLIENT
             )
             obstacle_id = p.createMultiBody(

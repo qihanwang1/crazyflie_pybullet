@@ -165,9 +165,10 @@ class CFAviary_MPC(BaseAviary):
         self.mpc_controller = MPC_Controller_Drone(
             horizon=mpc_params.get('horizon', 10),
             dt=mpc_params.get('dt', default_dt),
-            max_vel=mpc_params.get('max_vel', 0.5),
+            max_vel=mpc_params.get('max_vel', 5),
             max_yaw_rate=mpc_params.get('max_yaw_rate', 1.0),
-            safety_margin=mpc_params.get('safety_margin', 0.2),
+            safety_margin=mpc_params.get('safety_margin', 0.5),
+            obstacle_radius=0.1,              
         )
 
         print(f"[CFAviary_MPC] MPC controller initialized with params: "
@@ -320,7 +321,7 @@ class CFAviary_MPC(BaseAviary):
                       f"vx={self.setpoint.velocity.x:.3f}, vy={self.setpoint.velocity.y:.3f}, vz={self.setpoint.velocity.z:.3f}")
 
             # Apply MPC safety / planning filter if enabled
-            if self.use_mpc and obstacle_positions is not None and self.tick > self.firmware_freq * 0.5:
+            if self.use_mpc and obstacle_positions is not None:
                 self._apply_mpc_filter(cur_pos, cur_vel, cur_rpy, obstacle_positions, obstacle_velocities)
 
                 if self.tick % 500 == 0:
@@ -354,59 +355,56 @@ class CFAviary_MPC(BaseAviary):
         self.prev_rpy = np.array([obs[7], obs[8], obs[9]])
 
     def _apply_mpc_filter(self, pos, vel, rpy, obstacle_positions, obstacle_velocities):
-        """Apply MPC-based safety / planning filter to modify velocity setpoints.
+        """Apply MPC-based planner to generate safe velocity setpoints.
 
-        Parameters
-        ----------
-        pos : ndarray
-            Current position [x, y, z] in global frame.
-        vel : ndarray
-            Current velocity [vx, vy, vz] in global frame.
-        rpy : ndarray
-            Current roll-pitch-yaw in radians.
-        obstacle_positions : list
-            [[x1,y1,z1], [x2,y2,z2], ...].
-        obstacle_velocities : list | None
-            [[vx1,vy1,vz1], [vx2,vy2,vz2], ...].
+        - The MPC sees the full position/velocity state of the drone.
+        - The goal position for the MPC is taken from the current high-level
+          position setpoint (what the outer trajectory wants).
+        - The yaw-rate reference is passed through from the Crazyflie setpoint.
         """
+
         if self.drone is None or self.mpc_controller is None:
             return
 
-        # Update drone state used by MPC (angular velocities are not needed explicitly here)
+        # Update internal drone state used by MPC
         self.drone.update_state(pos.tolist(), vel.tolist(), rpy.tolist(), self.firmware_dt)
 
-        # Nominal reference from Mellinger (as velocity command)
+        # Goal position for MPC: track the current high-level position setpoint
+        p_goal = np.array([
+            self.setpoint.position.x,
+            self.setpoint.position.y,
+            self.setpoint.position.z
+        ], dtype=float)
+        self.mpc_controller.set_goal_position(p_goal)
+
+        # Nominal control: only yaw_rate is really used by the MPC controller,
+        # translational part is kept for potential extensions.
         u_ref = np.array([
             self.setpoint.velocity.x,
             self.setpoint.velocity.y,
             self.setpoint.velocity.z,
             self.setpoint.attitudeRate.yaw / self.RAD_TO_DEG  # deg/s -> rad/s
-        ]).reshape(-1, 1)
-
-        if self.tick % 500 == 0:
-            print(f"\n[MPC INPUT]")
-            print(f"[MPC] u_ref from Mellinger: vx={u_ref[0,0]:.3f}, vy={u_ref[1,0]:.3f}, vz={u_ref[2,0]:.3f}")
-            print(f"[MPC] Drone position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-            print(f"[MPC] Obstacles: {obstacle_positions}")
-
+        ], dtype=float).reshape(-1,)
         self.mpc_controller.set_reference_control(u_ref)
 
+        # Normalize obstacle inputs
+        if obstacle_positions is None:
+            obstacle_positions = []
         if obstacle_velocities is None:
             obstacle_velocities = [[0.0, 0.0, 0.0] for _ in range(len(obstacle_positions))]
 
+        # Setup and solve MPC QP
         self.mpc_controller.setup_QP(self.drone, obstacle_positions, obstacle_velocities)
-        self.mpc_controller.solve_QP(self.drone)
+        status, obj_val = self.mpc_controller.solve_QP(self.drone)
 
-        u_safe = self.mpc_controller.get_optimal_control()  # shape (4,)
+        u_safe = self.mpc_controller.get_optimal_control()  # [vx, vy, vz, yaw_rate]
 
-        if self.tick % 500 == 0:
-            print(f"[MPC OUTPUT] u_safe: vx={u_safe[0]:.3f}, vy={u_safe[1]:.3f}, vz={u_safe[2]:.3f}, yaw_rate={u_safe[3]:.3f}")
-
-        # Overwrite firmware setpoint velocities with MPC-safe command
+        # Overwrite Crazyflie velocity setpoint with MPC-safe command
         self.setpoint.velocity.x = float(u_safe[0])
         self.setpoint.velocity.y = float(u_safe[1])
         self.setpoint.velocity.z = float(u_safe[2])
         self.setpoint.attitudeRate.yaw = float(u_safe[3]) * self.RAD_TO_DEG  # rad/s -> deg/s
+
 
     ##################################
     ########## Sensor Data ###########
