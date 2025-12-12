@@ -2,14 +2,14 @@ import numpy as np
 from cvxopt import matrix, solvers
 
 from .MPC_controller import MPC_Controller
-from .drone import Drone  # for type clarity; not strictly required at runtime
+from .drone import Drone  
 
 solvers.options['show_progress'] = False
 
 
 class MPC_Controller_Drone(MPC_Controller):
     """
-    MPC controller for a single drone with state-barrier (CBF-like) obstacle avoidance.
+    MPC controller for a single drone with CBF-style first-step obstacle avoidance.
 
     - Decision variables: translational velocities v_k in R^3 for k = 0,...,N-1
     - Dynamics: p_{k+1} = p_k + dt * v_k  (discrete-time integrator)
@@ -18,9 +18,8 @@ class MPC_Controller_Drone(MPC_Controller):
         * Quadratic penalty on position tracking w.r.t. p_goal over the horizon
     - Constraints:
         * Box constraints on v_k: |v_k,i| <= max_vel
-        * For each spherical obstacle j and each prediction step k,
-          enforce a linearized state-barrier condition
-              h_j(p_k) >= 0
+        * For each spherical obstacle j, enforce a CBF condition on v_0:
+              2 (p0 - c_j)^T v_0 + alpha * h_j(p0) >= 0,
           where h_j(p) = ||p - c_j||^2 - R_total^2.
     """
 
@@ -30,9 +29,10 @@ class MPC_Controller_Drone(MPC_Controller):
                  max_vel: float = 5.0,
                  max_yaw_rate: float = None,
                  safety_margin: float = 0.2,
-                 Q_p_diag=(5,5,0.2),
+                 Q_p_diag=(5, 5, 0.2),
                  R_v_diag=(0.5, 0.5, 0.5),
                  obstacle_radius: float = 0.1,
+                 cbf_alpha: float = 1.0,
                  **unused_kwargs):
         super().__init__(horizon=horizon, dt=dt)
 
@@ -48,6 +48,9 @@ class MPC_Controller_Drone(MPC_Controller):
         # Obstacle geometry (all spherical, same radius here)
         self.obstacle_radius = float(obstacle_radius)
 
+        # CBF gain
+        self.cbf_alpha = float(cbf_alpha)
+
         # Reference control (mainly to pass yaw rate through)
         self.u_ref = np.zeros(4)
 
@@ -60,10 +63,8 @@ class MPC_Controller_Drone(MPC_Controller):
         # State at the current MPC solve
         self.p0 = None  # current drone position
 
-        # Cached barrier data for the current solve:
-        # for each obstacle j, store (g_j, h0_j)
-        self._barrier_grads = None   # list of np.ndarray(3,)
-        self._barrier_offsets = None # list of float (h_j(p0))
+        # Obstacle centers for current solve
+        self.obstacle_centers = []
 
     # -------------------------------------------------------------------------
     # Public interface
@@ -98,80 +99,34 @@ class MPC_Controller_Drone(MPC_Controller):
         self.p_goal = p_goal.copy()
 
     # -------------------------------------------------------------------------
-    # Obstacle → state-barrier linearization
+    # Obstacle setup
     # -------------------------------------------------------------------------
 
-    def _build_state_barriers(self, bot: Drone, centers):
+    def _set_obstacle_centers(self, centers):
         """
-        For each spherical obstacle with center c_j and total safety radius R_total,
-        build a state-barrier function
+        Normalize obstacle centers for current solve.
 
-            h_j(p) = ||p - c_j||^2 - R_total^2
-
-        and linearize it at the current position p0:
-
-            h_j(p) ≈ h_j(p0) + g_j^T (p - p0)
-
-        where
-
-            g_j = ∇h_j(p0) = 2 (p0 - c_j).
-
-        We then enforce, for each prediction step k:
-
-            h_j(p0) + g_j^T (p_k - p0) >= 0.
-
-        With the integrator model p_k = p0 + dt * sum_{m=0}^{k-1} v_m, this becomes
-        a linear inequality in the decision vector v.
+        `centers` can be:
+            - a single 3D point [x, y, z],
+            - or a list of such points.
         """
-        self._barrier_grads = None
-        self._barrier_offsets = None
+        self.obstacle_centers = []
 
-        if centers is None or len(centers) == 0:
+        if centers is None:
             return
 
-        p0 = np.array([bot.x, bot.y, bot.z], dtype=float)
-        self.p0 = p0
-
-        # Normalize to list of 3D centers
-        if isinstance(centers[0], (list, tuple, np.ndarray)):
-            obs_positions = [np.asarray(ci, dtype=float).flatten() for ci in centers]
-        else:
-            obs_positions = [np.asarray(centers, dtype=float).flatten()]
-
-        # Effective safety radius: obstacle sphere + drone radius + margin
-        R_drone = float(bot.encompassing_radius)
-        R_total = self.obstacle_radius + R_drone + self.safety_margin
-
-        grads = []
-        h0_list = []
-
-        for c in obs_positions:
-            r0 = p0 - c
-            dist = np.linalg.norm(r0)
-
-            # If the drone is exactly at the obstacle center, skip this obstacle
-            if dist < 1e-6:
-                continue
-
-            # Barrier gradient at p0
-            g_j = 2.0 * r0  # ∇_p ||p - c||^2 = 2 (p - c)
-
-            # Barrier value at p0
-            h0_j = float(r0.dot(r0) - R_total**2)
-
-            # If already inside the safety radius, clamp h0_j to 0
-            # so that the constraint does not immediately become infeasible.
-            if h0_j < 0.0:
-                h0_j = 0.0
-
-            grads.append(g_j)
-            h0_list.append(h0_j)
-
-        if len(grads) == 0:
+        # Single obstacle as [x, y, z]
+        if isinstance(centers, (list, tuple, np.ndarray)) and np.array(centers).ndim == 1:
+            c = np.asarray(centers, dtype=float).flatten()
+            if c.size == 3:
+                self.obstacle_centers.append(c)
             return
 
-        self._barrier_grads = grads
-        self._barrier_offsets = h0_list
+        # List of centers
+        for ci in centers:
+            ci = np.asarray(ci, dtype=float).flatten()
+            if ci.size == 3:
+                self.obstacle_centers.append(ci)
 
     # -------------------------------------------------------------------------
     # MPC setup and solve
@@ -197,8 +152,8 @@ class MPC_Controller_Drone(MPC_Controller):
         if self.p_goal is None:
             self.p_goal = self.p0.copy()
 
-        # Build state-barrier linearizations for all spherical obstacles
-        self._build_state_barriers(bot, c)
+        # Store obstacle centers for CBF in solve_QP
+        self._set_obstacle_centers(c)
 
     def solve_QP(self, bot: Drone):
         """
@@ -276,33 +231,47 @@ class MPC_Controller_Drone(MPC_Controller):
                 G_list.append(row)
                 h_list.append(max_vel)
 
-        # 2) State-barrier constraints for all obstacles and all steps:
+        # 2) CBF constraints on the first control v_0
         #
-        # For each obstacle j and for each prediction step k,
-        # enforce
-        #       h_j(p_k) ≈ h0_j + g_j^T (p_k - p0) >= 0
-        # with
-        #       p_k = p0 + dt * sum_{m=0}^{k-1} v_m.
+        # For each spherical obstacle j with center c_j and effective safety
+        # radius R_total, we define
         #
-        # This yields a linear inequality in v:
-        #       dt * sum_{m=0}^{k-1} g_j^T v_m >= -h0_j
-        # which we write in G v <= h form as
-        #       -dt * sum_{m=0}^{k-1} g_j^T v_m <= h0_j.
-        if self._barrier_grads is not None and self._barrier_offsets is not None:
-            for g_j, h0_j in zip(self._barrier_grads, self._barrier_offsets):
-                g_j = np.asarray(g_j, dtype=float).reshape(3,)
-                h0_j = float(h0_j)
+        #   h_j(p) = ||p - c_j||^2 - R_total^2,
+        #
+        # and enforce the discrete-time CBF condition at the current state p0:
+        #
+        #   dh_j/dt + alpha * h_j(p0) >= 0,
+        #
+        # where dh_j/dt = 2 (p0 - c_j)^T v_0 for dynamics \dot p = v.
+        #
+        # This yields a linear inequality in v_0:
+        #
+        #   2 (p0 - c_j)^T v_0 + alpha * h_j(p0) >= 0.
+        #
+        # In G v <= h form:
+        #
+        #   -2 (p0 - c_j)^T v_0 <= alpha * h_j(p0).
+        #
+        if self.obstacle_centers:
+            R_drone = float(bot.encompassing_radius)
+            R_total = self.obstacle_radius + R_drone + self.safety_margin
 
-                for k in range(1, N + 1):
-                    row = np.zeros(n_v, dtype=float)
-                    # contribution from v_0,...,v_{k-1}
-                    for m in range(k):
-                        m_idx = 3 * m
-                        row[m_idx:m_idx+3] += dt * g_j
+            for c_j in self.obstacle_centers:
+                c_j = np.asarray(c_j, dtype=float).flatten()
+                r0 = p0 - c_j
+                dist_sq = float(r0.dot(r0))
+                h0_j = dist_sq - R_total**2
 
-                    # row @ v >= -h0_j  →  -row @ v <= h0_j
-                    G_list.append(-row)
-                    h_list.append(h0_j)
+                if h0_j < 0.0:
+                    h0_j = 0.0
+
+                g_cbf = 2.0 * r0  # ∇_p h_j(p0)
+
+                row = np.zeros(n_v, dtype=float)
+                row[0:3] = -g_cbf  # -2 (p0 - c_j)^T v_0
+
+                G_list.append(row)
+                h_list.append(self.cbf_alpha * h0_j)
 
         if len(G_list) > 0:
             G = matrix(np.vstack(G_list), tc='d')
